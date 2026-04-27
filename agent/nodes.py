@@ -10,11 +10,16 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any
 
+from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
 from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
+
+# Load environment variables from .env if present
+load_dotenv()
 
 from agent.state import AgentState, IntentType
 from agent.tools import STAYEASE_TOOLS
@@ -107,19 +112,20 @@ def classify_intent_node(state: AgentState) -> dict[str, Any]:
 
     text = last_human.content.lower()
 
-    # Simple keyword-based classification; replace with LLM call for production.
+    # 1. ESCALATE (Priority: Handoff to human)
     if any(
         kw in text
-        for kw in (
-            "search",
-            "find",
-            "available",
-            "looking for",
-            "need a room",
-            "want a place",
-        )
+        for kw in ("human", "agent", "support", "help me with something else", "other")
     ):
-        intent: IntentType = "search"
+        intent: IntentType = "escalate"
+
+    # 2. BOOK (Action-oriented)
+    elif any(
+        kw in text for kw in ("book", "reserve", "confirm", "i'll take", "go ahead")
+    ):
+        intent = "book"
+
+    # 3. DETAILS (Specific info)
     elif any(
         kw in text
         for kw in (
@@ -132,15 +138,27 @@ def classify_intent_node(state: AgentState) -> dict[str, Any]:
         )
     ):
         intent = "details"
-    elif any(
-        kw in text for kw in ("book", "reserve", "confirm", "i'll take", "go ahead")
-    ):
-        intent = "book"
+
+    # 4. SEARCH (Discovery)
     elif any(
         kw in text
-        for kw in ("human", "agent", "support", "help me with something else", "other")
+        for kw in (
+            "search",
+            "find",
+            "available",
+            "looking for",
+            "need a room",
+            "need a place",
+            "want a place",
+            "stay in",
+            "accommodation",
+            "hotel",
+            "cottage",
+            "resort",
+            "place to stay",
+        )
     ):
-        intent = "escalate"
+        intent = "search"
     else:
         # Fallback — let the LLM decide in agent_node
         intent = "unknown"
