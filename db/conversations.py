@@ -1,54 +1,131 @@
 """
 db/conversations.py
 --------------------
-Handles persistence of chat history in the `conversations` table.
+Handles persistence of chat history using the conversations and
+conversation_messages tables (one row per message, no JSONB array).
 """
 
 import json
-from datetime import datetime
+import uuid
 from typing import Any
-import asyncpg
+
 from db import get_pool
 
-async def get_conversation_history(conversation_id: str) -> list[dict[str, Any]]:
-    """Retrieve history from the DB."""
-    pool = await get_pool()
-    async with pool.acquire() as conn:
-        # We use the conversation_id (UUID) to find the record.
-        # If it doesn't exist, return empty list.
-        row = await conn.fetchrow(
-            "SELECT messages FROM conversations WHERE id = $1::uuid",
-            conversation_id
-        )
-        if row:
-            return json.loads(row["messages"])
-        return []
 
-async def save_conversation_message(conversation_id: str, message: dict[str, Any]):
-    """Append a message to the conversation history in DB."""
+async def get_conversation_history(conversation_id: str) -> list[dict[str, Any]]:
+    """Return all messages for a conversation ordered by creation time."""
     pool = await get_pool()
     async with pool.acquire() as conn:
-        # Use an UPSERT style approach
-        history = await get_conversation_history(conversation_id)
-        history.append(message)
-        
-        await conn.execute(
+        rows = await conn.fetch(
             """
-            INSERT INTO conversations (id, messages, updated_at)
-            VALUES ($1::uuid, $2::jsonb, NOW())
-            ON CONFLICT (id) DO UPDATE
-            SET messages = $2::jsonb, updated_at = NOW()
+            SELECT message_id, role, content, metadata, created_at
+            FROM conversation_messages
+            WHERE conversation_id = $1::text
+            ORDER BY created_at ASC
             """,
             conversation_id,
-            json.dumps(history)
         )
+        return [
+            {
+                "message_id": row["message_id"],
+                "role": row["role"],
+                "content": row["content"],
+                "timestamp": row["created_at"].isoformat(),
+                **(
+                    row["metadata"]
+                    if isinstance(row["metadata"], dict)
+                    else json.loads(row["metadata"] or "{}")
+                ),
+            }
+            for row in rows
+        ]
+
+
+async def save_conversation_message(conversation_id: str, message: dict[str, Any]):
+    """
+    Persist a single message atomically.
+
+    Creates the parent conversations row if it doesn't exist yet.
+    Extra keys beyond role/content/message_id/timestamp are stored as
+    message-level metadata (intent, booking_id, etc.).
+    """
+    role = message["role"]
+    content = message["content"]
+    message_id = message.get("message_id") or str(uuid.uuid4())
+
+    skip = {"role", "content", "message_id", "timestamp"}
+    extra = {k: v for k, v in message.items() if k not in skip}
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                """
+                INSERT INTO conversations (id, updated_at)
+                VALUES ($1::text, NOW())
+                ON CONFLICT (id) DO UPDATE SET updated_at = NOW()
+                """,
+                conversation_id,
+            )
+            await conn.execute(
+                """
+                INSERT INTO conversation_messages
+                    (conversation_id, message_id, role, content, metadata)
+                VALUES ($1::text, $2, $3, $4, $5::jsonb)
+                ON CONFLICT (message_id) DO NOTHING
+                """,
+                conversation_id,
+                message_id,
+                role,
+                content,
+                json.dumps(extra),
+            )
+
 
 async def update_conversation_metadata(conversation_id: str, metadata: dict[str, Any]):
-    """Update metadata for a conversation."""
+    """Merge new key-value pairs into the conversation's metadata JSONB."""
     pool = await get_pool()
     async with pool.acquire() as conn:
         await conn.execute(
-            "UPDATE conversations SET metadata = metadata || $2::jsonb WHERE id = $1::uuid",
+            "UPDATE conversations SET metadata = metadata || $2::jsonb WHERE id = $1::text",
             conversation_id,
-            json.dumps(metadata)
+            json.dumps(metadata),
         )
+
+
+async def list_conversations() -> list[dict[str, Any]]:
+    """Return all conversations with last-message preview, newest first."""
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                c.id       AS conversation_id,
+                c.metadata,
+                c.updated_at,
+                lm.content AS last_content
+            FROM conversations c
+            LEFT JOIN LATERAL (
+                SELECT content
+                FROM conversation_messages
+                WHERE conversation_id = c.id
+                ORDER BY created_at DESC
+                LIMIT 1
+            ) lm ON TRUE
+            ORDER BY c.updated_at DESC
+            """,
+        )
+        result = []
+        for row in rows:
+            meta = row["metadata"]
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+            text = row["last_content"]
+            preview = (text[:60] + "...") if text and len(text) > 60 else text
+            result.append({
+                "conversation_id": row["conversation_id"],
+                "last_intent": (meta or {}).get("intent"),
+                "last_message_preview": preview,
+                "updated_at": row["updated_at"].isoformat() if row["updated_at"] else None,
+            })
+        return result
