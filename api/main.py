@@ -9,6 +9,8 @@ Exposes two endpoints:
 from __future__ import annotations
 
 import uuid
+import os
+import httpx
 from datetime import datetime, timezone
 from typing import Any
 from contextlib import asynccontextmanager
@@ -19,7 +21,15 @@ from pydantic import BaseModel, Field
 
 from agent.graph import run_agent
 from db import close_pool
-from db.conversations import get_conversation_history, save_conversation_message, update_conversation_metadata
+from db.conversations import get_conversation_history, save_conversation_message, update_conversation_metadata, list_conversations
+
+
+
+class ModelAvailabilityResponse(BaseModel):
+    model_name: str
+    is_available: bool
+    status_detail: str
+    timestamp: datetime
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -108,11 +118,8 @@ async def send_message(
     """
     Send a guest message to the StayEase AI agent and receive a reply.
     """
-    # Verify conversation_id is a valid UUID
-    try:
-        uuid.UUID(conversation_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid conversation_id format (UUID required).")
+    if not conversation_id.strip():
+        raise HTTPException(status_code=400, detail="conversation_id must not be empty.")
 
     # Retrieve existing history from DB
     history = await get_conversation_history(conversation_id)
@@ -198,11 +205,8 @@ async def get_history(conversation_id: str) -> ConversationHistoryResponse:
     """
     Retrieve the full message history for a conversation.
     """
-    # Verify conversation_id is a valid UUID
-    try:
-        uuid.UUID(conversation_id)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Invalid conversation_id format (UUID required).")
+    if not conversation_id.strip():
+        raise HTTPException(status_code=400, detail="conversation_id must not be empty.")
 
     history = await get_conversation_history(conversation_id)
 
@@ -224,6 +228,49 @@ async def get_history(conversation_id: str) -> ConversationHistoryResponse:
 
 
 # ---------------------------------------------------------------------------
+# GET /api/conversations
+# ---------------------------------------------------------------------------
+
+
+class ConversationSummary(BaseModel):
+    conversation_id: str
+    last_intent: str | None = None
+    last_message_preview: str | None = None
+    updated_at: str | None = None
+
+
+class ConversationListResponse(BaseModel):
+    conversations: list[ConversationSummary]
+    total: int
+
+
+@app.get(
+    "/api/conversations",
+    response_model=ConversationListResponse,
+    status_code=status.HTTP_200_OK,
+    summary="List all conversations",
+    tags=["Chat"],
+)
+async def get_conversations() -> ConversationListResponse:
+    """
+    List all conversations ordered by updated_at DESC.
+    """
+    convos = await list_conversations()
+    return ConversationListResponse(
+        conversations=[
+            ConversationSummary(
+                conversation_id=c["conversation_id"],
+                last_intent=c["last_intent"],
+                last_message_preview=c["last_message_preview"],
+                updated_at=c["updated_at"],
+            )
+            for c in convos
+        ],
+        total=len(convos),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Health check
 # ---------------------------------------------------------------------------
 
@@ -231,3 +278,62 @@ async def get_history(conversation_id: str) -> ConversationHistoryResponse:
 @app.get("/health", tags=["System"])
 async def health() -> dict[str, str]:
     return {"status": "ok", "service": "stayease-agent"}
+
+
+@app.get(
+    "/api/model/availability",
+    response_model=ModelAvailabilityResponse,
+    status_code=status.HTTP_200_OK,
+    summary="Check LLM model availability from OpenRouter",
+    tags=["System"],
+)
+async def get_model_availability() -> ModelAvailabilityResponse:
+    """
+    Check if the configured OpenRouter model is currently available.
+    """
+    model_name = os.environ.get("OPENROUTER_MODEL", "anthropic/claude-sonnet-4-6")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+
+    if not api_key:
+        return ModelAvailabilityResponse(
+            model_name=model_name,
+            is_available=False,
+            status_detail="OpenRouter API key missing.",
+            timestamp=datetime.now(timezone.utc),
+        )
+
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get("https://openrouter.ai/api/v1/models")
+            if response.status_code != 200:
+                return ModelAvailabilityResponse(
+                    model_name=model_name,
+                    is_available=False,
+                    status_detail=f"OpenRouter API returned error: {response.status_code}",
+                    timestamp=datetime.now(timezone.utc),
+                )
+
+            models_data = response.json().get("data", [])
+            found = any(m.get("id") == model_name for m in models_data)
+
+            if found:
+                return ModelAvailabilityResponse(
+                    model_name=model_name,
+                    is_available=True,
+                    status_detail="Model is listed and available on OpenRouter.",
+                    timestamp=datetime.now(timezone.utc),
+                )
+            else:
+                return ModelAvailabilityResponse(
+                    model_name=model_name,
+                    is_available=False,
+                    status_detail="Model not found in OpenRouter's active models list.",
+                    timestamp=datetime.now(timezone.utc),
+                )
+    except Exception as e:
+        return ModelAvailabilityResponse(
+            model_name=model_name,
+            is_available=False,
+            status_detail=f"Error checking availability: {str(e)}",
+            timestamp=datetime.now(timezone.utc),
+        )

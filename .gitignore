@@ -153,6 +153,25 @@ cython_debug/
 # MacOS
 .DS_Store
 
+# Claude AI / Anthropic specific
+.claude/
+agents/
+.agent/
+run_cache/
+
+# AGENTS.md and CLAUDE.md
+AGENTS.md
+CLAUDE.md
+
+# Cursor IDE
+.cursor/
+
+# Windsurf IDE
+.windsurf/
+
+# Env files
+.env
+
 # LangGraph / LangChain specific
 *.db
 *.sqlite
