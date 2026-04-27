@@ -9,13 +9,21 @@ the PostgreSQL database on Neon.
 from __future__ import annotations
 
 import uuid
-from datetime import date, datetime
+from datetime import date
 from typing import Any
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
 
 from db import get_pool
+
+
+def _parse_uuid(value: str, field: str) -> uuid.UUID | None:
+    """Return a UUID object, or None if the value is not a valid UUID."""
+    try:
+        return uuid.UUID(value)
+    except (ValueError, AttributeError):
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -43,6 +51,15 @@ class SearchPropertiesInput(BaseModel):
         ge=1,
         le=20,
         description="Number of guests (1–20).",
+    )
+    property_type: str | None = Field(
+        None,
+        description=(
+            "Optional filter by property type. "
+            "Allowed values: 'apartment', 'cottage', 'resort', 'lodge', "
+            "'villa', 'guesthouse', 'hostel', 'other'. "
+            "Leave null to return all types."
+        ),
     )
 
 
@@ -96,6 +113,7 @@ async def search_available_properties(
     check_in: str,
     check_out: str,
     num_guests: int,
+    property_type: str | None = None,
 ) -> list[dict[str, Any]]:
     """
     Search for available property listings on StayEase.
@@ -114,6 +132,17 @@ async def search_available_properties(
     check_out_date = date.fromisoformat(check_out)
     nights = (check_out_date - check_in_date).days
 
+    # Normalize location for search - handle common variations
+    # Create search patterns for variations like "Cox's Bazar" vs "Coxs Bazar" vs "Cox Bazar"
+    location_normalized = location.replace("'", "").strip()
+    location_patterns = [
+        f"%{location}%",
+        f"%{location_normalized}%",
+    ]
+    # Add "cox's bazar" variation if relevant
+    if "coxs" in location_normalized.lower() or "cox" in location_normalized.lower():
+        location_patterns.append(f"%Cox's Bazar%")
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         rows = await conn.fetch(
@@ -121,29 +150,40 @@ async def search_available_properties(
             SELECT
                 id::text,
                 title,
+                property_type,
                 location,
                 price_per_night_bdt,
                 capacity,
+                bedrooms,
+                bathrooms,
                 amenities,
                 rating,
                 thumbnail_url
             FROM listings
             WHERE
-                location ILIKE $1
-                AND capacity >= $2
+                capacity >= $1
                 AND is_active = TRUE
+                AND ($4::text IS NULL OR property_type::text = $4)
+                AND (
+                    location ILIKE $2 
+                    OR location ILIKE $3
+                    OR location ILIKE $5
+                )
                 AND id NOT IN (
                     SELECT listing_id
                     FROM bookings
                     WHERE status != 'cancelled'
-                      AND check_in  < $4
-                      AND check_out > $3
+                      AND check_in  < $7
+                      AND check_out > $6
                 )
             ORDER BY rating DESC NULLS LAST
             LIMIT 10
             """,
-            f"%{location}%",
             num_guests,
+            location_patterns[0],
+            location_patterns[1] if len(location_patterns) > 1 else location_patterns[0],
+            property_type,
+            location_patterns[2] if len(location_patterns) > 2 else location_patterns[0],
             check_in_date,
             check_out_date,
         )
@@ -152,10 +192,13 @@ async def search_available_properties(
         {
             "id": str(row["id"]),
             "title": row["title"],
+            "property_type": row["property_type"],
             "location": row["location"],
             "price_per_night_bdt": row["price_per_night_bdt"],
             "total_price_bdt": row["price_per_night_bdt"] * nights,
             "capacity": row["capacity"],
+            "bedrooms": row["bedrooms"],
+            "bathrooms": row["bathrooms"],
             "amenities": list(row["amenities"]),
             "rating": float(row["rating"]) if row["rating"] is not None else None,
             "thumbnail_url": row["thumbnail_url"],
@@ -175,6 +218,15 @@ async def get_listing_details(listing_id: str) -> dict[str, Any]:
     Used when: the agent classifies the guest's intent as 'details',
     or as a prerequisite before creating a booking.
     """
+    if _parse_uuid(listing_id, "listing_id") is None:
+        return {
+            "error": (
+                f"'{listing_id}' is not a valid listing ID. "
+                "Please search for properties first and use the exact UUID "
+                "from the search results (e.g. 'a3f28c1d-8e4b-1a6f-0c5d-9e2b7a1c4f8d')."
+            )
+        }
+
     pool = await get_pool()
     async with pool.acquire() as conn:
         row = await conn.fetchrow(
@@ -183,6 +235,7 @@ async def get_listing_details(listing_id: str) -> dict[str, Any]:
                 id::text,
                 title,
                 description,
+                property_type,
                 location,
                 address,
                 price_per_night_bdt,
@@ -211,6 +264,7 @@ async def get_listing_details(listing_id: str) -> dict[str, Any]:
         "id": str(row["id"]),
         "title": row["title"],
         "description": row["description"],
+        "property_type": row["property_type"],
         "location": row["location"],
         "address": row["address"],
         "price_per_night_bdt": row["price_per_night_bdt"],
@@ -249,6 +303,15 @@ async def create_booking(
     Used when: the agent classifies the guest's intent as 'book' and all
     required parameters are available in state.
     """
+    if _parse_uuid(listing_id, "listing_id") is None:
+        return {
+            "error": (
+                f"'{listing_id}' is not a valid listing ID. "
+                "Please search for properties first and use the exact UUID "
+                "from the search results (e.g. 'a3f28c1d-8e4b-1a6f-0c5d-9e2b7a1c4f8d')."
+            )
+        }
+
     check_in_date = date.fromisoformat(check_in)
     check_out_date = date.fromisoformat(check_out)
     nights = (check_out_date - check_in_date).days

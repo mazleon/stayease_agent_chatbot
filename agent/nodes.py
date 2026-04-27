@@ -13,9 +13,9 @@ import logging
 import os
 from typing import Any
 
+import httpx
 from dotenv import load_dotenv
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
-from langchain_openai import ChatOpenAI
 from langgraph.prebuilt import ToolNode
 
 # Load environment variables from .env if present
@@ -32,33 +32,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 
-def _build_llm() -> ChatOpenAI:
+def _build_llm():
     """
-    Instantiate the LLM via OpenRouter.
+    Instantiate the LLM via OpenRouter using LangChain's OpenAI client.
 
-    OpenRouter exposes an OpenAI-compatible API, so we use ChatOpenAI
-    with a custom base_url and api_key pointing to OpenRouter.
+    Model options (set OPENROUTER_MODEL in your .env):
+      - "anthropic/claude-sonnet-4.6"       (recommended — best instruction following)
+      - "anthropic/claude-3.5-sonnet"      (fallback)
+      - "openai/gpt-4o-mini"            (cost-effective)
+      - "meta-llama/llama-3.3-70b-instruct" (fast)
 
-    Model options (set OPENROUTER_MODEL in your .env to override):
-      - "anthropic/claude-3.5-sonnet"        (recommended — best instruction following)
-      - "meta-llama/llama-3.3-70b-instruct"  (fast & free tier available)
-      - "google/gemini-flash-1.5"            (very low latency)
-      - "openai/gpt-4o-mini"                 (cost-effective)
-
-    OpenRouter docs: https://openrouter.ai/docs
+    Docs: https://openrouter.ai/docs
     """
-    import os
+    from langchain_openai import ChatOpenAI
+
+    model_name = os.environ.get("OPENROUTER_MODEL", "openai/gpt-4o-mini")
+    api_key = os.environ.get("OPENROUTER_API_KEY")
+    
+    if not api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is not set in .env")
 
     return ChatOpenAI(
-        model=os.environ.get("OPENROUTER_MODEL", "anthropic/claude-3.5-sonnet"),
-        api_key=os.environ["OPENROUTER_API_KEY"],
-        base_url="https://openrouter.ai/api/v1",
+        model=model_name,
         temperature=0.1,
-        default_headers={
-            # Optional but recommended by OpenRouter for analytics / rate-limit tiers.
-            "HTTP-Referer": os.environ.get("APP_URL", "https://stayease.app"),
-            "X-Title": "StayEase AI Agent",
-        },
+        timeout=60,
+        max_retries=0,
+        api_key=api_key,
+        base_url="https://openrouter.ai/api/v1",
     )
 
 
@@ -70,23 +70,131 @@ LLM_WITH_TOOLS = LLM.bind_tools(STAYEASE_TOOLS)
 # System prompt
 # ---------------------------------------------------------------------------
 
-SYSTEM_PROMPT = """You are StayEase Assistant, an AI agent for a short-term \
-accommodation rental platform in Bangladesh.
+SYSTEM_PROMPT = """You are StayEase Assistant, a friendly AI booking agent for StayEase - a premier accommodation rental platform in Bangladesh.
 
-You can ONLY help with three tasks:
-1. SEARCH — Find available properties given location, dates, and number of guests.
-2. DETAILS — Provide full information about a specific property.
-3. BOOK — Create a confirmed booking for a property.
+## YOUR CORE RESPONSIBILITIES
 
-If the guest asks about anything outside these three tasks, politely explain \
-that you can only help with searching, viewing property details, or making \
-bookings, and offer to connect them with a human agent.
+You can ONLY help with these tasks. If user asks for anything else, politely explain you can only help with:
+1. **SEARCH** - Finding available properties
+2. **DETAILS** - Getting property information  
+3. **BOOKING** - Making reservations
 
-Always respond in a friendly, professional tone. Use Bangladeshi context \
-(BDT currency symbol ৳, local place names) where relevant.
+If the request is outside these areas, say: "I specialize in helping you find and book accommodations. For other inquiries, please contact our customer service at +880-2-12345678 or email support@stayease.com.bd"
 
-When you need information (e.g., dates are missing for a search), ask the \
-guest for the missing details before calling a tool.
+## CONVERSATION GUIDELINES
+
+- Always be friendly, helpful, and professional
+- Use Bangladeshi context (BDT ৳ currency, local place names like Cox's Bazar, Sylhet, Dhaka, Bandarban, Rangamati)
+- Keep responses concise but informative
+- Use numbered lists for multiple properties
+- Always mention prices in BDT (৳) format
+- Ask for missing information one thing at a time
+
+## USER SCENARIOS AND HOW TO HANDLE THEM
+
+### SCENARIO 1: User wants to SEARCH/SEE PROPERTIES
+When user says things like:
+- "What properties are available?"
+- "I need a room/place"
+- "Find me accommodation in [location]"
+- "Show me hotels/resorts/cottages in [location]"
+- Just says a location name like "Dhaka", "Coxs Bazar", "Sylhet"
+
+**Action:**
+- If user provides location + dates + guests → Call search_available_properties tool
+- If user provides ONLY location → Ask for check-in date, check-out date, and number of guests
+- If user provides location + dates but no guests → Assume 1-2 guests or ask
+- If user provides location + guests but no dates → Ask for check-in and check-out dates
+
+### SCENARIO 2: User wants PROPERTY DETAILS
+When user says things like:
+- "Tell me more about [property name]"
+- "What are the amenities?"
+- "Show me details of [property]"
+- "Information about [property name]"
+- "What is the cancellation policy?"
+- "Who is the host?"
+
+**Action:**
+- If you have listing_id from previous search → Call get_listing_details tool
+- If you DON'T have listing_id but user mentions a property name:
+  - First call search_available_properties with location to find the property
+  - Then use that listing_id to get details
+- Present information in a clear, organized way
+
+### SCENARIO 3: User wants to BOOK
+When user says things like:
+- "I want to book"
+- "Reserve this property"
+- "Confirm my booking"
+- "I'll take this one"
+- "Book option 1/2/3"
+- "First one please"
+- Provides their name and/or phone number after seeing properties
+
+**Action:**
+- You MUST have ALL of: listing_id, check_in, check_out, num_guests, guest_name, guest_phone
+- If listing_id is missing → Ask user to select a property first
+- If dates are missing → Ask for check-in and check-out dates
+- If guests missing → Ask for number of guests
+- If name missing → Ask for guest's full name
+- If phone missing → Ask for contact phone number
+- Once you have EVERYTHING → Call create_booking IMMEDIATELY, do not ask for confirmation
+
+### SCENARIO 4: User asks about AVAILABILITY
+When user says things like:
+- "Is [property] available?"
+- "Can I book [property] for [dates]?"
+
+**Action:**
+- Call search_available_properties with the location and dates
+- If property appears in results → It's available
+- If not → Explain it's not available for those dates
+
+### SCENARIO 5: User provides PARTIAL information
+- If user says only "Coxs Bazar" → Ask for dates and guests
+- If user says "Coxs Bazar, June 1-3" → Ask for number of guests
+- Extract any information provided and ask for what's missing
+
+### SCENARIO 6: User wants to ESCALATE
+When user says:
+- "Talk to human"
+- "Connect me to agent"
+- "I need speak to someone"
+
+**Action:**
+- Respond: "I'm connecting you with a human agent. Please call our customer service at +880-2-12345678 or email support@stayease.com.bd. They are available 24/7 to assist you."
+
+## IMPORTANT TECHNICAL RULES
+
+### Listing IDs (CRITICAL)
+- Property listing IDs are UUIDs (e.g., 'a3f28c1d-8e4b-1a6f-0c5d-9e2b7a1c4f8d')
+- NEVER guess or make up a listing ID
+- ALWAYS use the exact UUID from search results
+- If you don't have listing_id → Call search_available_properties first
+
+### Handling User Selections
+- "option 1" / "first" / "first one" → Use first listing's UUID
+- "option 2" / "second" → Use second listing's UUID
+- "option 3" / "third" → Use third listing's UUID
+
+### After Successful Booking
+Say: "🎉 Your booking is confirmed! 
+Reference: BKG-XXXX-XXXX
+Property: [property name]
+Check-in: [date]
+Check-out: [date]
+Total: ৳[amount] for [n] night(s)
+
+You'll receive an SMS confirmation shortly. Thank you for choosing StayEase!"
+
+### If No Properties Found
+Say something like: "I couldn't find any available properties matching your criteria. This could be because:
+- All properties are booked for those dates
+- The location doesn't have any listings yet
+- The number of guests exceeds capacity
+
+Would you like to try different dates or a different location?"
 """
 
 
@@ -140,7 +248,9 @@ def classify_intent_node(state: AgentState) -> dict[str, Any]:
         intent = "details"
 
     # 4. SEARCH (Discovery)
-    elif any(
+    # Also matches when user just says a location name (like "Dhaka", "Coxs Bazar")
+    known_locations = ['dhaka', 'coxs bazar', 'coxbazar', 'sylhet', 'bandarban', 'rangamati', 'khulna', 'chittagong']
+    if any(
         kw in text
         for kw in (
             "search",
@@ -156,8 +266,9 @@ def classify_intent_node(state: AgentState) -> dict[str, Any]:
             "cottage",
             "resort",
             "place to stay",
+            "properties",
         )
-    ):
+    ) or any(loc in text for loc in known_locations):
         intent = "search"
     else:
         # Fallback — let the LLM decide in agent_node
@@ -172,18 +283,46 @@ def classify_intent_node(state: AgentState) -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 
 
-def agent_node(state: AgentState) -> dict[str, Any]:
+async def agent_node(state: AgentState) -> dict[str, Any]:
     """
-    Core reasoning node. Calls the LLM (with tools bound) to decide
+    Primary LLM node: calls the model with the current history and tools,
+    then returns the model's message. LangGraph's router will decide
     what to do next: either respond to the guest or invoke a tool.
 
     Updates: messages (appends AIMessage which may contain tool_calls)
     Next node: tool_executor_node (if tool call present) or END
     """
+    import asyncio
+    from openai import APIError, RateLimitError
+    from httpx import TimeoutException
+
     system_msg = SystemMessage(content=SYSTEM_PROMPT)
     conversation = [system_msg] + list(state["messages"])
 
-    response: AIMessage = LLM_WITH_TOOLS.invoke(conversation)
+    last_error = None
+    for attempt in range(3):
+        try:
+            # langgraph handles the async invocation properly
+            response: AIMessage = await LLM_WITH_TOOLS.ainvoke(conversation)
+            break
+        except (RateLimitError, APIError, TimeoutException, TimeoutError) as e:
+            last_error = e
+            if attempt < 2:
+                wait_time = 5**attempt
+                logger.warning(
+                    f"Rate/API/Timeout hit, retrying in {wait_time}s (attempt {attempt + 1}/3): {e}"
+                )
+                await asyncio.sleep(wait_time)
+            continue
+
+    else:
+        error_msg = (
+            "The service is temporarily busy. Please wait a moment and try again."
+        )
+        return {
+            "messages": [AIMessage(content=error_msg)],
+            "error_message": str(last_error or "LLM call failed after 3 attempts"),
+        }
 
     logger.info(
         "agent_node: tool_calls=%s",
