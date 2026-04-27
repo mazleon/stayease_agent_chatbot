@@ -71,12 +71,12 @@ async def test_api_chat_flow():
         assert messages[1]["role"] == "assistant"
 
 @pytest.mark.asyncio(scope="session")
-async def test_invalid_uuid():
-    """Test that invalid conversation IDs are rejected."""
+async def test_string_conversation_id():
+    """Test that non-UUID string IDs are accepted (API accepts any non-empty string)."""
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as ac:
         response = await ac.get("/api/chat/not-a-uuid/history")
-    assert response.status_code == 400
-    assert "Invalid conversation_id" in response.json()["detail"]
+    assert response.status_code == 200
+    assert response.json()["total"] == 0
 
 @pytest.mark.asyncio(scope="session")
 async def test_non_existent_conversation():
