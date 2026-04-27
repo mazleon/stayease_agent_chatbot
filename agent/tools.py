@@ -1,11 +1,21 @@
+"""
+StayEase Agent Tools
+---------------------
+Three async tools exposed to the LLM via the @tool decorator.
+Each tool uses the asyncpg connection pool (db.get_pool) to query
+the PostgreSQL database on Neon.
+"""
+
 from __future__ import annotations
 
 import uuid
-from datetime import date
+from datetime import date, datetime
 from typing import Any
 
 from langchain_core.tools import tool
 from pydantic import BaseModel, Field
+
+from db import get_pool
 
 
 # ---------------------------------------------------------------------------
@@ -81,7 +91,7 @@ class CreateBookingInput(BaseModel):
 
 
 @tool("search_available_properties", args_schema=SearchPropertiesInput)
-def search_available_properties(
+async def search_available_properties(
     location: str,
     check_in: str,
     check_out: str,
@@ -92,60 +102,70 @@ def search_available_properties(
 
     Queries the `listings` table for properties in the given location that:
       - have capacity >= num_guests
-      - are NOT already booked for the requested date range
+      - are NOT already booked (confirmed) for the requested date range
 
     Returns a list of matching property summaries including id, title,
-    price_per_night_bdt, capacity, and amenities.
+    price_per_night_bdt, capacity, amenities, rating, and total_price_bdt
+    for the requested stay duration.
 
     Used when: the agent classifies the guest's intent as 'search'.
-
-    Example output:
-    [
-        {
-            "id": "a1b2c3d4-...",
-            "title": "Ocean View Suite",
-            "location": "Cox's Bazar",
-            "price_per_night_bdt": 4500,
-            "capacity": 4,
-            "amenities": ["WiFi", "AC", "Sea View"],
-            "rating": 4.7
-        },
-        ...
-    ]
     """
-    # returning mock data for now
     check_in_date = date.fromisoformat(check_in)
     check_out_date = date.fromisoformat(check_out)
     nights = (check_out_date - check_in_date).days
 
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        rows = await conn.fetch(
+            """
+            SELECT
+                id::text,
+                title,
+                location,
+                price_per_night_bdt,
+                capacity,
+                amenities,
+                rating,
+                thumbnail_url
+            FROM listings
+            WHERE
+                location ILIKE $1
+                AND capacity >= $2
+                AND is_active = TRUE
+                AND id NOT IN (
+                    SELECT listing_id
+                    FROM bookings
+                    WHERE status != 'cancelled'
+                      AND check_in  < $4
+                      AND check_out > $3
+                )
+            ORDER BY rating DESC NULLS LAST
+            LIMIT 10
+            """,
+            f"%{location}%",
+            num_guests,
+            check_in_date,
+            check_out_date,
+        )
+
     return [
         {
-            "id": "prop-001",
-            "title": "Seabreeze Cottage",
-            "location": location,
-            "price_per_night_bdt": 3800,
-            "total_price_bdt": 3800 * nights,
-            "capacity": max(num_guests, 2),
-            "amenities": ["WiFi", "AC", "Breakfast Included", "Sea View"],
-            "rating": 4.6,
-            "thumbnail_url": "https://example.com/img/seabreeze.jpg",
-        },
-        {
-            "id": "prop-002",
-            "title": "Hillside Family Resort",
-            "location": location,
-            "price_per_night_bdt": 6500,
-            "total_price_bdt": 6500 * nights,
-            "capacity": max(num_guests, 6),
-            "amenities": ["WiFi", "AC", "Pool", "Kitchen", "Parking"],
-            "rating": 4.9,
-            "thumbnail_url": "https://example.com/img/hillside.jpg",
-        },
+            "id": str(row["id"]),
+            "title": row["title"],
+            "location": row["location"],
+            "price_per_night_bdt": row["price_per_night_bdt"],
+            "total_price_bdt": row["price_per_night_bdt"] * nights,
+            "capacity": row["capacity"],
+            "amenities": list(row["amenities"]),
+            "rating": float(row["rating"]) if row["rating"] is not None else None,
+            "thumbnail_url": row["thumbnail_url"],
+        }
+        for row in rows
     ]
 
 
 @tool("get_listing_details", args_schema=GetListingDetailsInput)
-def get_listing_details(listing_id: str) -> dict[str, Any]:
+async def get_listing_details(listing_id: str) -> dict[str, Any]:
     """
     Fetch full details for a single property listing.
 
@@ -154,58 +174,62 @@ def get_listing_details(listing_id: str) -> dict[str, Any]:
 
     Used when: the agent classifies the guest's intent as 'details',
     or as a prerequisite before creating a booking.
-
-    Example output:
-    {
-        "id": "prop-001",
-        "title": "Seabreeze Cottage",
-        "description": "Cozy beachfront cottage ...",
-        "location": "Cox's Bazar",
-        "address": "Plot 12, Kolatoli Beach Road",
-        "price_per_night_bdt": 3800,
-        "capacity": 4,
-        "bedrooms": 2,
-        "bathrooms": 1,
-        "amenities": ["WiFi", "AC", "Breakfast Included"],
-        "house_rules": "No smoking. Check-in after 2 PM.",
-        "cancellation_policy": "Free cancellation up to 48 hours before check-in.",
-        "host_name": "Rahim Uddin",
-        "host_phone": "+8801711XXXXXX",
-        "rating": 4.6,
-        "review_count": 38
-    }
     """
-    # Stub
-    if listing_id not in ("prop-001", "prop-002"):
-        return {"error": f"Listing '{listing_id}' not found."}
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        row = await conn.fetchrow(
+            """
+            SELECT
+                id::text,
+                title,
+                description,
+                location,
+                address,
+                price_per_night_bdt,
+                capacity,
+                bedrooms,
+                bathrooms,
+                amenities,
+                house_rules,
+                cancellation_policy,
+                host_name,
+                host_phone,
+                rating,
+                review_count,
+                thumbnail_url
+            FROM listings
+            WHERE id = $1::uuid
+              AND is_active = TRUE
+            """,
+            listing_id,
+        )
+
+    if row is None:
+        return {"error": f"Listing '{listing_id}' not found or is no longer active."}
 
     return {
-        "id": listing_id,
-        "title": "Seabreeze Cottage"
-        if listing_id == "prop-001"
-        else "Hillside Family Resort",
-        "description": (
-            "A beautifully furnished beachfront cottage steps away from Cox's Bazar "
-            "Marine Drive. Perfect for couples and small families."
-        ),
-        "location": "Cox's Bazar",
-        "address": "Plot 12, Kolatoli Beach Road, Cox's Bazar-4700",
-        "price_per_night_bdt": 3800 if listing_id == "prop-001" else 6500,
-        "capacity": 4 if listing_id == "prop-001" else 6,
-        "bedrooms": 2,
-        "bathrooms": 1,
-        "amenities": ["WiFi", "AC", "Breakfast Included", "Sea View", "Hot Water"],
-        "house_rules": "No smoking. No pets. Check-in after 2:00 PM. Check-out by 11:00 AM.",
-        "cancellation_policy": "Free cancellation up to 48 hours before check-in.",
-        "host_name": "Rahim Uddin",
-        "host_phone": "+8801711000000",
-        "rating": 4.6,
-        "review_count": 38,
+        "id": str(row["id"]),
+        "title": row["title"],
+        "description": row["description"],
+        "location": row["location"],
+        "address": row["address"],
+        "price_per_night_bdt": row["price_per_night_bdt"],
+        "capacity": row["capacity"],
+        "bedrooms": row["bedrooms"],
+        "bathrooms": row["bathrooms"],
+        "amenities": list(row["amenities"]),
+        "house_rules": row["house_rules"],
+        "cancellation_policy": row["cancellation_policy"],
+        "host_name": row["host_name"],
+        "host_phone": row["host_phone"],
+        "rating": float(row["rating"]) if row["rating"] is not None else None,
+        "review_count": row["review_count"],
+        "thumbnail_url": row["thumbnail_url"],
     }
 
 
 @tool("create_booking", args_schema=CreateBookingInput)
-def create_booking(
+async def create_booking(
     listing_id: str,
     guest_name: str,
     guest_phone: str,
@@ -216,53 +240,103 @@ def create_booking(
     """
     Create a confirmed booking for a property on StayEase.
 
-    Inserts a row into the `bookings` table with status='confirmed' and
-    returns the booking reference, total price (in BDT), and confirmation
-    details.
+    Verifies the listing exists and is available for the dates, then inserts
+    a row into the `bookings` table with status='confirmed'.
+
+    Returns the booking reference ID, total price in BDT, and a confirmation
+    message. Raises an error if the listing is no longer available.
 
     Used when: the agent classifies the guest's intent as 'book' and all
-    required parameters (listing_id, guest info, dates) are available in state.
-
-    Example output:
-    {
-        "booking_id": "BKG-20250601-XXXX",
-        "status": "confirmed",
-        "listing_title": "Seabreeze Cottage",
-        "location": "Cox's Bazar",
-        "check_in": "2025-06-01",
-        "check_out": "2025-06-03",
-        "num_guests": 2,
-        "total_price_bdt": 7600,
-        "guest_name": "Farhan Ahmed",
-        "confirmation_message": "Your booking is confirmed! ..."
-    }
+    required parameters are available in state.
     """
-    # returning mock data for now
     check_in_date = date.fromisoformat(check_in)
     check_out_date = date.fromisoformat(check_out)
     nights = (check_out_date - check_in_date).days
-    price_per_night = 3800 if listing_id == "prop-001" else 6500
-    total = price_per_night * nights
-    booking_ref = f"BKG-{check_in.replace('-', '')}-{str(uuid.uuid4())[:4].upper()}"
+
+    pool = await get_pool()
+    async with pool.acquire() as conn:
+        # 1. Fetch listing & verify it exists
+        listing = await conn.fetchrow(
+            """
+            SELECT id::text, title, location, price_per_night_bdt
+            FROM listings
+            WHERE id = $1::uuid AND is_active = TRUE
+            """,
+            listing_id,
+        )
+        if listing is None:
+            return {"error": f"Listing '{listing_id}' not found or is no longer active."}
+
+        price_per_night: int = listing["price_per_night_bdt"]
+        total_price = price_per_night * nights
+
+        # 2. Check availability (no overlapping confirmed bookings)
+        conflict = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM bookings
+            WHERE listing_id = $1::uuid
+              AND status      != 'cancelled'
+              AND check_in     < $3
+              AND check_out    > $2
+            """,
+            listing_id,
+            check_in_date,
+            check_out_date,
+        )
+        if conflict > 0:
+            return {
+                "error": (
+                    f"'{listing['title']}' is not available from {check_in} to {check_out}. "
+                    "Please choose different dates."
+                )
+            }
+
+        # 3. Insert booking inside a transaction
+        async with conn.transaction():
+            booking_row = await conn.fetchrow(
+                """
+                INSERT INTO bookings (
+                    listing_id, guest_name, guest_phone,
+                    check_in, check_out, num_guests,
+                    total_price_bdt, status
+                ) VALUES (
+                    $1::uuid, $2, $3,
+                    $4, $5, $6,
+                    $7, 'confirmed'
+                )
+                RETURNING id::text, created_at
+                """,
+                listing_id,
+                guest_name,
+                guest_phone,
+                check_in_date,
+                check_out_date,
+                num_guests,
+                total_price,
+            )
+
+    # Build a human-readable reference from the UUID prefix
+    booking_uuid_prefix = booking_row["id"][:8].upper()
+    booking_ref = f"BKG-{check_in.replace('-', '')}-{booking_uuid_prefix}"
 
     return {
         "booking_id": booking_ref,
+        "booking_uuid": booking_row["id"],
         "status": "confirmed",
         "listing_id": listing_id,
-        "listing_title": "Seabreeze Cottage"
-        if listing_id == "prop-001"
-        else "Hillside Family Resort",
-        "location": "Cox's Bazar",
+        "listing_title": listing["title"],
+        "location": listing["location"],
         "check_in": check_in,
         "check_out": check_out,
         "nights": nights,
         "num_guests": num_guests,
-        "total_price_bdt": total,
+        "total_price_bdt": total_price,
         "guest_name": guest_name,
         "guest_phone": guest_phone,
+        "created_at": booking_row["created_at"].isoformat(),
         "confirmation_message": (
             f"✅ Booking confirmed! Your reference is **{booking_ref}**. "
-            f"Total: ৳{total:,} for {nights} night(s). "
+            f"Total: ৳{total_price:,} for {nights} night(s). "
             "You'll receive an SMS confirmation shortly."
         ),
     }
