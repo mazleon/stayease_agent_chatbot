@@ -73,9 +73,10 @@ Send a guest's natural-language message to the AI agent and receive a reply.
 | `role`            | string   | Always `"assistant"`                                           |
 | `content`         | string   | The agent's reply in natural language                          |
 | `timestamp`       | string   | ISO-8601 UTC timestamp                                         |
-| `metadata.intent` | string   | Classified intent: `search` \| `details` \| `book` \| `escalate` |
+| `metadata.intent` | string   | Classified intent: `search` | `details` | `book` | `escalate` |
 | `metadata.search_results_count` | integer | Number of properties returned (search flow only) |
-| `metadata.booking_id` | string \| null | Booking reference if a booking was created       |
+| `metadata.booking_id` | string | null | Booking reference if a booking was created       |
+| `metadata.booking_confirmed` | boolean | Whether a booking was successfully confirmed       |
 
 ---
 
@@ -99,6 +100,7 @@ Send a guest's natural-language message to the AI agent and receive a reply.
   "metadata": {
     "intent": "book",
     "booking_id": "BKG-20250601-A3F2",
+    "booking_confirmed": true,
     "search_results_count": 0
   }
 }
@@ -110,8 +112,9 @@ Send a guest's natural-language message to the AI agent and receive a reply.
 
 | Status | Body                                                                 | When                                      |
 |--------|----------------------------------------------------------------------|-------------------------------------------|
-| `422`  | `{"error": "Validation error", "detail": "message: field required"}` | Missing or invalid request body fields    |
-| `500`  | `{"error": "Agent error", "detail": "LLM timeout after 30s"}`        | Agent or LLM failure                      |
+| `400`  | `{"detail": "Invalid conversation_id format (UUID required)."}`      | Invalid UUID in path                      |
+| `422`  | `{"detail": [{"loc": ["body", "message"], "msg": "field required"}]}`| Missing or invalid request body fields    |
+| `500`  | `{"detail": "Agent error: ..."}`                                     | Agent or LLM failure                      |
 
 ---
 
@@ -186,9 +189,10 @@ No request body or query parameters.
 
 ### Error Responses
 
-| Status | Body                                                                                      | When                                     |
-|--------|-------------------------------------------------------------------------------------------|------------------------------------------|
-| `404`  | `{"error": "Not found", "detail": "Conversation 'f47ac10b-...' not found."}`              | `conversation_id` does not exist in DB   |
+| Status | Body                                                                 | When                                     |
+|--------|----------------------------------------------------------------------|------------------------------------------|
+| `400`  | `{"detail": "Invalid conversation_id format (UUID required)."}`      | Invalid UUID in path                     |
+| `200`  | `{"conversation_id": "...", "messages": [], "total": 0}`             | conversation_id does not exist yet (normal behavior) |
 
 ---
 
@@ -200,3 +204,19 @@ No request body or query parameters.
 - Monetary values are always integers in BDT (Bangladeshi Taka, ৳). No decimals.
 - A new `conversation_id` must be generated client-side (UUID v4) before calling `POST /message` for the first time.
 - Clients should include `Content-Type: application/json` on POST requests.
+
+---
+
+## Endpoint 3 — Health Check
+
+### `GET /health`
+
+Simple system health check to verify the API service is running.
+
+**Success Response (`200 OK`):**
+```json
+{
+  "status": "ok",
+  "service": "stayease-agent"
+}
+```
